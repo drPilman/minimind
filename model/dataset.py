@@ -4,7 +4,8 @@ import re
 
 import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset
+from datasets import load_dataset
 import torch
 from sklearn.model_selection import train_test_split
 import os
@@ -12,7 +13,41 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-class PretrainDataset(Dataset):
+def preprocess(tokenizer, max_length, padding):
+    def process(row):
+        text = row["text"]
+        text = f"{tokenizer.bos_token}{str(text)}{tokenizer.eos_token}"
+        input_id = tokenizer(text).data["input_ids"][:max_length]
+        text_len = len(input_id)
+
+        padding_len = max_length - text_len
+        input_id = input_id + [padding] * padding_len
+        loss_mask = [1] * text_len + [0] * padding_len
+
+        input_id = np.array(input_id)
+        X = np.array(input_id[:-1]).astype(np.int64)
+        Y = np.array(input_id[1:]).astype(np.int64)
+        loss_mask = np.array(loss_mask[1:]).astype(np.int64)
+        data = {
+            "X": torch.from_numpy(X),
+            "Y": torch.from_numpy(Y),
+            "mask": torch.from_numpy(loss_mask),
+        }
+        return data
+
+    return process
+
+
+def pretrain_stream_dataset(tokenizer, max_length=512, padding=0):
+    dataset = load_dataset(
+        "IlyaGusev/rulm", streaming=True, split="train", trust_remote_code=True
+    )
+    return dataset.map(
+        preprocess(tokenizer, max_length, padding), remove_columns=["text", "meta"]
+    )
+
+
+class PretrainDataset(IterableDataset):
     def __init__(self, df, tokenizer, max_length=512):
         super().__init__()
         self.df = df
@@ -20,19 +55,13 @@ class PretrainDataset(Dataset):
         self.max_length = max_length
         self.padding = 0
 
-    def __len__(self):
-        return self.df.shape[0]
-
-    def __getitem__(self, index: int):
-        #
-        sample = self.df.iloc[index]
-        text = f"{self.tokenizer.bos_token}{str(sample['text'])}{self.tokenizer.eos_token}"
-        input_id = self.tokenizer(text).data['input_ids'][:self.max_length]
+    def process(self, text):
+        text = f"{self.tokenizer.bos_token}{str(text)}{self.tokenizer.eos_token}"
+        input_id = self.tokenizer(text).data["input_ids"][: self.max_length]
         text_len = len(input_id)
-        # 没满最大长度的剩余部分
+
         padding_len = self.max_length - text_len
         input_id = input_id + [self.padding] * padding_len
-        # 0表示不计算损失
         loss_mask = [1] * text_len + [0] * padding_len
 
         input_id = np.array(input_id)
@@ -42,8 +71,40 @@ class PretrainDataset(Dataset):
         return torch.from_numpy(X), torch.from_numpy(Y), torch.from_numpy(loss_mask)
 
 
+# class PretrainDataset(Dataset):
+#     def __init__(self, df, tokenizer, max_length=512):
+#         super().__init__()
+#         self.df = df
+#         self.tokenizer = tokenizer
+#         self.max_length = max_length
+#         self.padding = 0
+
+#     def __len__(self):
+#         return self.df.shape[0]
+
+#     def __getitem__(self, index: int):
+#         #
+#         sample = self.df.iloc[index]
+#         text = f"{self.tokenizer.bos_token}{str(sample['text'])}{self.tokenizer.eos_token}"
+#         input_id = self.tokenizer(text).data['input_ids'][:self.max_length]
+#         text_len = len(input_id)
+#         # 没满最大长度的剩余部分
+#         padding_len = self.max_length - text_len
+#         input_id = input_id + [self.padding] * padding_len
+#         # 0表示不计算损失
+#         loss_mask = [1] * text_len + [0] * padding_len
+
+#         input_id = np.array(input_id)
+#         X = np.array(input_id[:-1]).astype(np.int64)
+#         Y = np.array(input_id[1:]).astype(np.int64)
+#         loss_mask = np.array(loss_mask[1:]).astype(np.int64)
+#         return torch.from_numpy(X), torch.from_numpy(Y), torch.from_numpy(loss_mask)
+
+
 class SFTDataset(Dataset):
-    def __init__(self, df, tokenizer, max_length=1024, prompt_max_len=512, answer_max_len=256):
+    def __init__(
+        self, df, tokenizer, max_length=1024, prompt_max_len=512, answer_max_len=256
+    ):
         super().__init__()
         self.df = df
         self.max_length = max_length
@@ -52,7 +113,7 @@ class SFTDataset(Dataset):
         #
         self.tokenizer = tokenizer
         self.padding = 0
-        self.bos_id = self.tokenizer('<s>assistant').data['input_ids']
+        self.bos_id = self.tokenizer("<s>assistant").data["input_ids"]
 
     def __len__(self):
         return self.df.shape[0]
@@ -60,7 +121,7 @@ class SFTDataset(Dataset):
     def find_sublist_index(self, main_list, sub_list) -> int:
         last_index = -1
         for i in range(len(main_list) - len(sub_list) + 1):
-            if main_list[i:i + len(sub_list)] == sub_list:
+            if main_list[i : i + len(sub_list)] == sub_list:
                 last_index = i
         return last_index
 
@@ -74,19 +135,25 @@ class SFTDataset(Dataset):
     def __getitem__(self, index: int):
         #
         sample = self.df.iloc[index]
-        history = self.safe_eval(sample['history'])
-        q = str(sample['q'])
-        a = str(sample['a'])
+        history = self.safe_eval(sample["history"])
+        q = str(sample["q"])
+        a = str(sample["a"])
 
         messages = []
         for history_message in history:
             if len(history_message) <= 1:
                 continue
             messages.append(
-                {"role": 'user', "content": str(history_message[0])[:self.max_length // 2]}
+                {
+                    "role": "user",
+                    "content": str(history_message[0])[: self.max_length // 2],
+                }
             )
             messages.append(
-                {"role": 'assistant', "content": str(history_message[1])[:self.max_length // 2]}
+                {
+                    "role": "assistant",
+                    "content": str(history_message[1])[: self.max_length // 2],
+                }
             )
 
         messages += [
@@ -94,14 +161,14 @@ class SFTDataset(Dataset):
             {"role": "assistant", "content": a},
         ]
         new_prompt = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True
         )
-        input_id = self.tokenizer(new_prompt).data['input_ids'][:self.max_length]
+        input_id = self.tokenizer(new_prompt).data["input_ids"][: self.max_length]
 
         # 实际长度
-        question_length = self.find_sublist_index(input_id, self.bos_id) + len(self.bos_id)
+        question_length = self.find_sublist_index(input_id, self.bos_id) + len(
+            self.bos_id
+        )
         # 没满最大长度的剩余部分
         padding_len = self.max_length - len(input_id)
         input_id = input_id + [self.padding] * padding_len

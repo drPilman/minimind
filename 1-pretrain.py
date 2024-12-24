@@ -18,9 +18,9 @@ from transformers import AutoTokenizer
 
 from model.model import Transformer
 from model.LMConfig import LMConfig
-from model.dataset import PretrainDataset
+from model.dataset import pretrain_stream_dataset
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 
 
 def Logger(content):
@@ -45,14 +45,14 @@ def get_lr(it, all):
 
 def train_epoch(epoch, wandb):
     start_time = time.time()
-    for step, (X, Y, loss_mask) in enumerate(train_loader):
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+    for step, data in enumerate(train_loader):
+        X = data["X"].to(args.device)
+        Y = data["Y"].to(args.device)
+        loss_mask = data["mask"].to(args.device)
 
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group["lr"] = lr
 
         with ctx:
             out = model(X, Y)
@@ -74,24 +74,31 @@ def train_epoch(epoch, wandb):
         if step % args.log_interval == 0:
             spend_time = time.time() - start_time
             Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} epoch_Time:{}min:'.format(
+                "Epoch:[{}/{}]({}/{}) loss:{:.3f} lr:{:.7f} epoch_Time:{}min:".format(
                     epoch,
                     args.epochs,
                     step,
                     iter_per_epoch,
                     loss.item() * args.accumulation_steps,
-                    optimizer.param_groups[-1]['lr'],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
+                    optimizer.param_groups[-1]["lr"],
+                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
+                )
+            )
 
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-                wandb.log({"loss": loss.item() * args.accumulation_steps,
-                           "lr": optimizer.param_groups[-1]['lr'],
-                           "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
+                wandb.log(
+                    {
+                        "loss": loss.item() * args.accumulation_steps,
+                        "lr": optimizer.param_groups[-1]["lr"],
+                        "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60
+                        - spend_time // 60,
+                    }
+                )
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
-            moe_path = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/pretrain_{lm_config.dim}{moe_path}.pth'
+            moe_path = "_moe" if lm_config.use_moe else ""
+            ckp = f"{args.save_dir}/pretrain_{lm_config.dim}{moe_path}.pth"
 
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
@@ -106,17 +113,18 @@ def init_model():
     def count_parameters(model):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    tokenizer = AutoTokenizer.from_pretrained('./model/minimind_tokenizer')
+    tokenizer = AutoTokenizer.from_pretrained("./model/minimind_tokenizer")
 
     model = Transformer(lm_config).to(args.device)
     # moe_path = '_moe' if lm_config.use_moe else ''
 
-    Logger(f'LLM总参数量：{count_parameters(model) / 1e6:.3f} 百万')
+    Logger(f"LLM params count：{count_parameters(model) / 1e6:.3f} млн")
     return model, tokenizer
 
 
 def init_distributed_mode():
-    if not ddp: return
+    if not ddp:
+        return
     global ddp_local_rank, DEVICE
 
     dist.init_process_group(backend="nccl")
@@ -133,21 +141,47 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default="out", help="Output directory")
     parser.add_argument("--epochs", type=int, default=20, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--learning_rate", type=float, default=2e-4, help="Learning rate")
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu",
-                        help="Device to use")
+    parser.add_argument(
+        "--learning_rate", type=float, default=2e-4, help="Learning rate"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0" if torch.cuda.is_available() else "cpu",
+        help="Device to use",
+    )
     parser.add_argument("--dtype", type=str, default="bfloat16", help="Data type")
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain", help="Weights & Biases project name")
-    parser.add_argument("--num_workers", type=int, default=1, help="Number of workers for data loading")
-    parser.add_argument("--data_path", type=str, default="./dataset/pretrain_data.csv", help="Path to training data")
-    parser.add_argument("--ddp", action="store_true", help="Use DistributedDataParallel")
-    parser.add_argument("--accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping threshold")
-    parser.add_argument("--warmup_iters", type=int, default=0, help="Number of warmup iterations")
-    parser.add_argument("--log_interval", type=int, default=100, help="Logging interval")
-    parser.add_argument("--save_interval", type=int, default=1000, help="Model saving interval")
-    parser.add_argument('--local_rank', type=int, default=-1, help='local rank for distributed training')
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="MiniMind-Pretrain",
+        help="Weights & Biases project name",
+    )
+    parser.add_argument(
+        "--num_workers", type=int, default=1, help="Number of workers for data loading"
+    )
+    parser.add_argument(
+        "--ddp", action="store_true", help="Use DistributedDataParallel"
+    )
+    parser.add_argument(
+        "--accumulation_steps", type=int, default=8, help="Gradient accumulation steps"
+    )
+    parser.add_argument(
+        "--grad_clip", type=float, default=1.0, help="Gradient clipping threshold"
+    )
+    parser.add_argument(
+        "--warmup_iters", type=int, default=0, help="Number of warmup iterations"
+    )
+    parser.add_argument(
+        "--log_interval", type=int, default=100, help="Logging interval"
+    )
+    parser.add_argument(
+        "--save_interval", type=int, default=1000, help="Model saving interval"
+    )
+    parser.add_argument(
+        "--local_rank", type=int, default=-1, help="local rank for distributed training"
+    )
 
     args = parser.parse_args()
 
@@ -167,6 +201,7 @@ if __name__ == "__main__":
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
     ddp_local_rank, DEVICE = 0, "cuda:0"
     if ddp:
+        print("use ddp")
         init_distributed_mode()
         args.device = torch.device(DEVICE)
 
@@ -178,9 +213,7 @@ if __name__ == "__main__":
         wandb = None
 
     model, tokenizer = init_model()
-    df = pd.read_csv(args.data_path)
-    df = df.sample(frac=1.0)
-    train_ds = PretrainDataset(df, tokenizer, max_length=max_seq_len)
+    train_ds = pretrain_stream_dataset(tokenizer, max_length=max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(
         train_ds,
@@ -189,13 +222,17 @@ if __name__ == "__main__":
         drop_last=False,
         shuffle=False,
         num_workers=args.num_workers,
-        sampler=train_sampler
+        sampler=train_sampler,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ["float16", "bfloat16"]))
     optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
 
-    if False and platform.system() != 'Windows' and float(torch.__version__.split('.')[0]) >= 2:
+    if (
+        False
+        and platform.system() != "Windows"
+        and float(torch.__version__.split(".")[0]) >= 2
+    ):
         Logger("compiling the model... (takes a ~minute)")
         unoptimized_model = model
         model = torch.compile(model)
@@ -204,6 +241,6 @@ if __name__ == "__main__":
         model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
-    iter_per_epoch = len(train_loader)
+    iter_per_epoch = train_ds.info.splits["train"].num_examples // args.batch_size
     for epoch in range(args.epochs):
         train_epoch(epoch, wandb)
