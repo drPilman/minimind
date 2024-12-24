@@ -17,14 +17,10 @@ import os
 random.seed(42)
 
 def train_tokenizer():
-    # 读取JSONL文件并提取文本数据
-    def read_texts_from_jsonl(file_path):
-        with open(file_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                data = json.loads(line)
-                yield data['text']
-
-    data_path = './dataset/tokenizer_train.jsonl'
+    def read_texts_from_dataset():
+        dataset = load_dataset("IlyaGusev/rulm", streaming=False, split="train", trust_remote_code=True)
+        for ent in dataset:
+            yield ent['text']
 
     # 初始化tokenizer
     tokenizer = Tokenizer(models.BPE())
@@ -42,7 +38,7 @@ def train_tokenizer():
     )
 
     # 读取文本数据
-    texts = read_texts_from_jsonl(data_path)
+    texts = read_texts_from_dataset()
 
     # 训练tokenizer
     tokenizer.train_from_iterator(texts, trainer=trainer)
@@ -113,6 +109,7 @@ def train_tokenizer():
 
     print("Tokenizer training completed and saved.")
 
+from tokenizers.decoders import ByteLevel
 
 def eval_tokenizer():
     from transformers import AutoTokenizer
@@ -121,26 +118,27 @@ def eval_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained("./model/minimind_tokenizer")
 
     messages = [
-        {"role": "system", "content": "你是一个优秀的聊天机器人，总是给我正确的回应！"},
-        {"role": "user", "content": '你来自哪里？'},
-        {"role": "assistant", "content": '我来自地球'}
+        {"role": "system", "content": "Ты очень полезный чат бот МТУСИ"},
+        {"role": "user", "content": 'Сколько в среднем пар в день у студента 1 курса？'},
+        {"role": "assistant", "content": 'От 3 до 4 пар в день.'}
     ]
     new_prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False
     )
-    print(new_prompt)
+    print(new_prompt, len(new_prompt))
 
-    # 获取实际词汇表长度（包括特殊符号）
     actual_vocab_size = len(tokenizer)
-    print('tokenizer实际词表长度：', actual_vocab_size)
+    print('tokenizer:', actual_vocab_size)
 
     model_inputs = tokenizer(new_prompt)
-    print('encoder长度：', len(model_inputs['input_ids']))
+    print('encoder:', len(model_inputs['input_ids']))
 
     input_ids = model_inputs['input_ids']
     response = tokenizer.decode(input_ids)
-    print('decoder和原始文本是否一致：', response == new_prompt)
+    print('decoder:', response == new_prompt)
+    decoder = ByteLevel()
+    print([decoder.decode([token]) for token in tokenizer.convert_ids_to_tokens(input_ids)])
 
 def main():
     # train_tokenizer()
